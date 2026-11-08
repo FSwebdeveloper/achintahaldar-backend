@@ -3,6 +3,8 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const dns = require("dns");
 const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
+const sanitizeHtml = require("sanitize-html");
 
 require("dotenv").config();
 
@@ -20,6 +22,8 @@ dns.setServers([
 // =====================================================
 
 const app = express();
+
+app.set("trust proxy", 1);
 
 // =====================================================
 // FRONTEND URL
@@ -40,7 +44,50 @@ app.use(
   })
 );
 
-app.use(express.json());
+// Request body size limit
+app.use(express.json({ limit: "10kb" }));
+
+// =====================================================
+// REVIEW RATE LIMITER
+// =====================================================
+
+const reviewLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: {
+    message:
+      "Too many review submissions. Please try again after 15 minutes.",
+  },
+});
+
+// =====================================================
+// REVIEW VALIDATION HELPERS
+// =====================================================
+
+const ALLOWED_CATEGORIES = [
+  "Web Design",
+  "Hearing AIDS",
+  "Electronics & Accessories",
+  "Vintage Audio Collection",
+  "Desktop & Laptop",
+  "Online Application",
+  "Upgrading & Reinstalling",
+];
+
+// Remove HTML tags
+function cleanText(value) {
+  return sanitizeHtml(value.trim(), {
+    allowedTags: [],
+    allowedAttributes: {},
+  }).trim();
+}
+
+// Email validation
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
 
 // =====================================================
 // ANONYMOUS VISITOR COOKIE
@@ -52,22 +99,11 @@ const ANONYMOUS_COOKIE_NAME =
 // =====================================================
 // GET / CREATE ANONYMOUS ID
 // =====================================================
-//
-// Visitor login না করলেও Like করতে পারবে.
-//
-// Browser-এর HttpOnly cookie-তে anonymous ID
-// রাখা হবে.
-//
-// Frontend JavaScript এই cookie read করতে পারবে না.
-// Backend নিজে cookie read করবে.
-// =====================================================
 
 function getAnonymousId(req, res) {
   let anonymousId = null;
 
-  // ===================================================
   // READ COOKIE
-  // ===================================================
 
   const cookieHeader =
     req.headers.cookie;
@@ -83,84 +119,61 @@ function getAnonymousId(req, res) {
       ] = cookie.trim().split("=");
 
       if (
-        name ===
-        ANONYMOUS_COOKIE_NAME
+        name === ANONYMOUS_COOKIE_NAME
       ) {
-        anonymousId = decodeURIComponent(
-          valueParts.join("=")
-        );
+        try {
+          anonymousId = decodeURIComponent(
+            valueParts.join("=")
+          );
+        } catch {
+          anonymousId = null;
+        }
 
         break;
       }
     }
   }
 
-  // ===================================================
-  // IF COOKIE ALREADY EXISTS
-  // ===================================================
+  // IF COOKIE EXISTS
 
-  if (anonymousId) {
+  if (
+    anonymousId &&
+    /^[a-f0-9-]{36}$/i.test(anonymousId)
+  ) {
     return anonymousId;
   }
 
-  // ===================================================
-  // CREATE NEW ANONYMOUS ID
-  // ===================================================
+  // CREATE NEW ID
 
   anonymousId =
     crypto.randomUUID();
 
-  // ===================================================
-  // ENVIRONMENT
-  // ===================================================
-
   const isProduction =
-    process.env.NODE_ENV ===
-    "production";
-
-  // ===================================================
-  // COOKIE OPTIONS
-  // ===================================================
+    process.env.NODE_ENV === "production";
 
   const cookieOptions = [
     `${ANONYMOUS_COOKIE_NAME}=${encodeURIComponent(
       anonymousId
     )}`,
-
     "Path=/",
-
     "HttpOnly",
-
-    // 1 year
     "Max-Age=31536000",
   ];
 
-  // ===================================================
   // PRODUCTION
-  // ===================================================
 
   if (isProduction) {
     cookieOptions.push("Secure");
-
-    // Frontend and backend are different domains
-    cookieOptions.push(
-      "SameSite=None"
-    );
+    cookieOptions.push("SameSite=None");
   }
 
-  // ===================================================
   // DEVELOPMENT
-  // ===================================================
 
   else {
-    cookieOptions.push(
-      "SameSite=Lax"
-    );
+    cookieOptions.push("SameSite=Lax");
   }
 
-  // ===================================================
   // SEND COOKIE
-  // ===================================================
 
   res.setHeader(
     "Set-Cookie",
@@ -177,70 +190,70 @@ function getAnonymousId(req, res) {
 const reviewSchema =
   new mongoose.Schema(
     {
-      // =================================================
       // NAME
-      // =================================================
 
       name: {
         type: String,
         required: true,
         trim: true,
+        minlength: 6,
+        maxlength: 50,
       },
 
-      // =================================================
       // EMAIL
-      // =================================================
 
       email: {
         type: String,
         required: true,
         trim: true,
+        lowercase: true,
+        maxlength: 254,
       },
 
-      // =================================================
       // PROFESSION
-      // =================================================
 
       post: {
         type: String,
         required: true,
         trim: true,
+        minlength: 2,
+        maxlength: 50,
       },
 
-      // =================================================
       // CATEGORY
-      // =================================================
 
       category: {
         type: String,
         required: true,
         trim: true,
+        enum: ALLOWED_CATEGORIES,
       },
 
-      // =================================================
       // RATING
-      // =================================================
 
       rating: {
         type: Number,
         required: true,
         min: 1,
         max: 5,
+        validate: {
+          validator: Number.isInteger,
+          message:
+            "Rating must be a whole number from 1 to 5.",
+        },
       },
 
-      // =================================================
       // REVIEW
-      // =================================================
 
       review: {
         type: String,
         required: true,
         trim: true,
+        minlength: 1,
+        maxlength: 500,
       },
 
-      // =================================================
       // PROFILE IMAGE
-      // =================================================
 
       imgURL: {
         type: String,
@@ -248,17 +261,7 @@ const reviewSchema =
           "https://lh3.googleusercontent.com/a/default-user=s32-cc",
       },
 
-      // =================================================
       // ANONYMOUS VISITOR ID
-      // =================================================
-      //
-      // Review submit করার সময় visitor-এর
-      // anonymous ID এখানে save হবে.
-      //
-      // এটি Like system-এর anonymous identity
-      // এবং review-এর সাথে visitor-এর relationship
-      // রাখতে সাহায্য করবে.
-      // =================================================
 
       anonymousId: {
         type: String,
@@ -266,9 +269,7 @@ const reviewSchema =
         index: true,
       },
 
-      // =================================================
       // LIKE COUNT
-      // =================================================
 
       likes: {
         type: Number,
@@ -276,9 +277,7 @@ const reviewSchema =
         min: 0,
       },
 
-      // =================================================
       // REVIEW APPROVAL
-      // =================================================
 
       approved: {
         type: Boolean,
@@ -303,24 +302,11 @@ const Review =
 // =====================================================
 // REVIEW LIKE SCHEMA
 // =====================================================
-//
-// এখানে Like-এর আলাদা document থাকবে.
-//
-// One visitor + one review = one Like.
-//
-// Example:
-//
-// reviewId + anonymousId
-//
-// একই combination আবার তৈরি হতে পারবে না.
-// =====================================================
 
 const reviewLikeSchema =
   new mongoose.Schema(
     {
-      // =================================================
       // REVIEW ID
-      // =================================================
 
       reviewId: {
         type:
@@ -329,9 +315,7 @@ const reviewLikeSchema =
         required: true,
       },
 
-      // =================================================
       // ANONYMOUS VISITOR ID
-      // =================================================
 
       anonymousId: {
         type: String,
@@ -344,11 +328,7 @@ const reviewLikeSchema =
   );
 
 // =====================================================
-// UNIQUE INDEX
-// =====================================================
-//
-// একই visitor একই review-তে
-// একটির বেশি Like document তৈরি করতে পারবে না.
+// UNIQUE LIKE INDEX
 // =====================================================
 
 reviewLikeSchema.index(
@@ -387,18 +367,49 @@ app.get("/", (req, res) => {
 
 app.post(
   "/api/reviews",
+  reviewLimiter,
   async (req, res) => {
     try {
       // ===============================================
-      // GET ANONYMOUS ID
+      // REQUEST BODY VALIDATION
       // ===============================================
 
-      const anonymousId =
-        getAnonymousId(req, res);
+      if (
+        !req.body ||
+        typeof req.body !== "object" ||
+        Array.isArray(req.body)
+      ) {
+        return res.status(400).json({
+          message: "Invalid request body.",
+        });
+      }
 
-      // ===============================================
-      // GET DATA FROM FRONTEND
-      // ===============================================
+      // Allowed fields
+
+      const allowedFields = [
+        "name",
+        "email",
+        "post",
+        "category",
+        "rating",
+        "review",
+        "imgURL",
+      ];
+
+      const unknownFields =
+        Object.keys(req.body).filter(
+          (field) =>
+            !allowedFields.includes(field)
+        );
+
+      if (unknownFields.length > 0) {
+        return res.status(400).json({
+          message:
+            "Request contains unsupported fields.",
+        });
+      }
+
+      // GET DATA
 
       const {
         name,
@@ -411,22 +422,238 @@ app.post(
       } = req.body;
 
       // ===============================================
-      // REQUIRED FIELD CHECK
+      // REQUIRED FIELD + DATA TYPE VALIDATION
+      // ===============================================
+
+      const requiredFields = {
+        name,
+        email,
+        post,
+        category,
+        review,
+      };
+
+      for (
+        const [field, value]
+        of Object.entries(requiredFields)
+      ) {
+        if (
+          typeof value !== "string" ||
+          !value.trim()
+        ) {
+          return res.status(400).json({
+            message:
+              `${field} is required and must be text.`,
+          });
+        }
+      }
+
+      if (
+        rating === undefined ||
+        rating === null ||
+        rating === ""
+      ) {
+        return res.status(400).json({
+          message: "Rating is required.",
+        });
+      }
+
+      // ===============================================
+      // CLEAN INPUTS (XSS DEFENCE)
+      // ===============================================
+
+      const cleanName =
+        cleanText(name);
+
+      const cleanEmail =
+        email.trim().toLowerCase();
+
+      const cleanPost =
+        cleanText(post);
+
+      const cleanCategory =
+        category.trim();
+
+      const cleanReview =
+        cleanText(review);
+
+      // ===============================================
+      // NAME VALIDATION
       // ===============================================
 
       if (
-        !name ||
-        !email ||
-        !post ||
-        !category ||
-        !rating ||
-        !review
+        cleanName.length < 6 ||
+        cleanName.length > 50
       ) {
         return res.status(400).json({
           message:
-            "Please fill all required fields.",
+            "Name must be between 6 and 50 characters.",
         });
       }
+
+      // ===============================================
+      // EMAIL VALIDATION
+      // ===============================================
+
+      if (
+        cleanEmail.length > 254 ||
+        !isValidEmail(cleanEmail)
+      ) {
+        return res.status(400).json({
+          message:
+            "Please provide a valid email address.",
+        });
+      }
+
+      // ===============================================
+      // PROFESSION VALIDATION
+      // ===============================================
+
+      if (
+        cleanPost.length < 2 ||
+        cleanPost.length > 50
+      ) {
+        return res.status(400).json({
+          message:
+            "Profession must be between 2 and 50 characters.",
+        });
+      }
+
+      // ===============================================
+      // CATEGORY VALIDATION
+      // ===============================================
+
+      if (
+        !ALLOWED_CATEGORIES.includes(
+          cleanCategory
+        )
+      ) {
+        return res.status(400).json({
+          message:
+            "Invalid review category.",
+        });
+      }
+
+      // ===============================================
+      // RATING VALIDATION
+      // ===============================================
+
+      const ratingNumber =
+        Number(rating);
+
+      if (
+        !Number.isInteger(ratingNumber) ||
+        ratingNumber < 1 ||
+        ratingNumber > 5
+      ) {
+        return res.status(400).json({
+          message:
+            "Rating must be a whole number from 1 to 5.",
+        });
+      }
+
+      // ===============================================
+      // REVIEW VALIDATION
+      // ===============================================
+
+      if (
+        !cleanReview ||
+        cleanReview.length > 500
+      ) {
+        return res.status(400).json({
+          message:
+            "Review is required and cannot exceed 500 characters.",
+        });
+      }
+
+      // WORD COUNT
+
+      const reviewWords =
+        cleanReview
+          .split(/\s+/)
+          .filter(Boolean);
+
+      if (reviewWords.length < 6) {
+        return res.status(400).json({
+          message:
+            "Review must contain at least 6 words.",
+        });
+      }
+
+      // ===============================================
+      // OPTIONAL IMAGE URL VALIDATION
+      // ===============================================
+
+      let safeImgURL =
+        "https://lh3.googleusercontent.com/a/default-user=s32-cc";
+
+      if (
+        imgURL !== undefined &&
+        imgURL !== null &&
+        imgURL !== ""
+      ) {
+        if (
+          typeof imgURL !== "string" ||
+          imgURL.length > 2048
+        ) {
+          return res.status(400).json({
+            message:
+              "Invalid profile image URL.",
+          });
+        }
+
+        try {
+          const parsedImageURL =
+            new URL(imgURL);
+
+          if (
+            !["http:", "https:"].includes(
+              parsedImageURL.protocol
+            )
+          ) {
+            throw new Error(
+              "Unsupported image URL protocol."
+            );
+          }
+
+          safeImgURL =
+            parsedImageURL.href;
+
+        } catch {
+          return res.status(400).json({
+            message:
+              "Profile image must be a valid HTTP or HTTPS URL.",
+          });
+        }
+      }
+
+      // ===============================================
+      // DUPLICATE EMAIL PREVENTION
+      // ===============================================
+
+      const existingReview =
+        await Review.findOne({
+          email: cleanEmail,
+        })
+          .collation({
+            locale: "en",
+            strength: 2,
+          })
+          .select("_id");
+
+      if (existingReview) {
+        return res.status(409).json({
+          message:
+            "A review has already been submitted with this email address.",
+        });
+      }
+
+      // ===============================================
+      // GET ANONYMOUS ID
+      // ===============================================
+
+      const anonymousId =
+        getAnonymousId(req, res);
 
       // ===============================================
       // CREATE NEW REVIEW
@@ -434,37 +661,20 @@ app.post(
 
       const newReview =
         new Review({
-          name: name.trim(),
-
-          email: email.trim(),
-
-          post: post.trim(),
-
-          category: category.trim(),
-
-          rating: Number(rating),
-
-          review: review.trim(),
-
-          imgURL:
-            imgURL ||
-            "https://lh3.googleusercontent.com/a/default-user=s32-cc",
-
-          // =========================================
-          // ANONYMOUS ID
-          // =========================================
-
+          name: cleanName,
+          email: cleanEmail,
+          post: cleanPost,
+          category: cleanCategory,
+          rating: ratingNumber,
+          review: cleanReview,
+          imgURL: safeImgURL,
           anonymousId,
 
-          // =========================================
-          // NEW REVIEW NEEDS APPROVAL
-          // =========================================
+          // Always pending approval
 
           approved: false,
 
-          // =========================================
-          // INITIAL LIKE COUNT
-          // =========================================
+          // Initial likes
 
           likes: 0,
         });
@@ -480,19 +690,44 @@ app.post(
       // RESPONSE
       // ===============================================
 
-      res.status(201).json({
+      return res.status(201).json({
         message:
           "Review submitted successfully. Waiting for approval.",
 
-        review: savedReview,
+        review: {
+          _id: savedReview._id,
+          approved: savedReview.approved,
+        },
       });
+
     } catch (error) {
       console.error(
         "POST review error:",
         error
       );
 
-      res.status(500).json({
+      // DUPLICATE KEY ERROR
+
+      if (error.code === 11000) {
+        return res.status(409).json({
+          message:
+            "A review has already been submitted with this email address.",
+        });
+      }
+
+      // MONGOOSE VALIDATION ERROR
+
+      if (
+        error.name === "ValidationError" ||
+        error.name === "CastError"
+      ) {
+        return res.status(400).json({
+          message:
+            "Review data is invalid. Please check your entries.",
+        });
+      }
+
+      return res.status(500).json({
         message:
           "Failed to submit review.",
       });
@@ -508,40 +743,29 @@ app.get(
   "/api/reviews",
   async (req, res) => {
     try {
-      // ===============================================
       // CREATE / GET ANONYMOUS ID
-      // ===============================================
-      //
-      // এটি গুরুত্বপূর্ণ।
-      //
-      // Visitor প্রথমবার website-এ reviews load
-      // করলে anonymous cookie তৈরি হতে পারে.
-      // ===============================================
 
       getAnonymousId(req, res);
 
-      // ===============================================
       // ONLY APPROVED REVIEWS
-      // ===============================================
 
       const reviews =
         await Review.find({
           approved: true,
         })
           .select(
-            "-anonymousId"
+            "-anonymousId -email"
           )
           .sort({
             createdAt: -1,
           });
 
-      // ===============================================
-      // SEND REVIEWS
-      // ===============================================
+      // RESPONSE
 
       res.status(200).json({
         reviews,
       });
+
     } catch (error) {
       console.error(
         "GET reviews error:",
@@ -559,37 +783,22 @@ app.get(
 // =====================================================
 // LIKE / UNLIKE REVIEW
 // =====================================================
-//
-// PUT
-// /api/reviews/:id/like
-//
-// No email required.
-//
-// Backend automatically identifies visitor
-// using anonymous HttpOnly cookie.
-// =====================================================
 
 app.put(
   "/api/reviews/:id/like",
   async (req, res) => {
     try {
-      // ===============================================
       // GET ANONYMOUS ID
-      // ===============================================
 
       const anonymousId =
         getAnonymousId(req, res);
 
-      // ===============================================
       // REVIEW ID
-      // ===============================================
 
       const reviewId =
         req.params.id;
 
-      // ===============================================
       // CHECK VALID MONGODB ID
-      // ===============================================
 
       if (
         !mongoose.Types.ObjectId.isValid(
@@ -602,18 +811,14 @@ app.put(
         });
       }
 
-      // ===============================================
       // FIND REVIEW
-      // ===============================================
 
       const review =
         await Review.findById(
           reviewId
         );
 
-      // ===============================================
       // REVIEW NOT FOUND
-      // ===============================================
 
       if (!review) {
         return res.status(404).json({
@@ -622,9 +827,7 @@ app.put(
         });
       }
 
-      // ===============================================
       // CHECK EXISTING LIKE
-      // ===============================================
 
       const existingLike =
         await ReviewLike.findOne({
@@ -637,17 +840,9 @@ app.put(
       // ===============================================
 
       if (existingLike) {
-        // ---------------------------------------------
-        // DELETE LIKE DOCUMENT
-        // ---------------------------------------------
-
         await ReviewLike.deleteOne({
           _id: existingLike._id,
         });
-
-        // ---------------------------------------------
-        // DECREASE LIKE COUNT
-        // ---------------------------------------------
 
         review.likes =
           Math.max(
@@ -656,10 +851,6 @@ app.put(
           );
 
         await review.save();
-
-        // ---------------------------------------------
-        // RESPONSE
-        // ---------------------------------------------
 
         return res.status(200).json({
           message:
@@ -680,14 +871,9 @@ app.put(
           reviewId,
           anonymousId,
         });
-      } catch (error) {
-        // =============================================
-        // DUPLICATE LIKE
-        // =============================================
 
-        if (
-          error.code === 11000
-        ) {
+      } catch (error) {
+        if (error.code === 11000) {
           return res.status(200).json({
             message:
               "Review already liked.",
@@ -702,18 +888,14 @@ app.put(
         throw error;
       }
 
-      // ===============================================
       // INCREASE LIKE COUNT
-      // ===============================================
 
       review.likes =
         Number(review.likes || 0) + 1;
 
       await review.save();
 
-      // ===============================================
       // RESPONSE
-      // ===============================================
 
       return res.status(200).json({
         message:
@@ -723,6 +905,7 @@ app.put(
 
         likes: review.likes,
       });
+
     } catch (error) {
       console.error(
         "LIKE/UNLIKE review error:",
@@ -740,35 +923,22 @@ app.put(
 // =====================================================
 // LIKE STATUS
 // =====================================================
-//
-// GET
-// /api/reviews/:id/like-status
-//
-// Frontend page load করার সময় এটি check করবে
-// visitor already Like করেছে কি না.
-// =====================================================
 
 app.get(
   "/api/reviews/:id/like-status",
   async (req, res) => {
     try {
-      // ===============================================
       // GET ANONYMOUS ID
-      // ===============================================
 
       const anonymousId =
         getAnonymousId(req, res);
 
-      // ===============================================
       // REVIEW ID
-      // ===============================================
 
       const reviewId =
         req.params.id;
 
-      // ===============================================
       // CHECK VALID MONGODB ID
-      // ===============================================
 
       if (
         !mongoose.Types.ObjectId.isValid(
@@ -781,18 +951,14 @@ app.get(
         });
       }
 
-      // ===============================================
       // FIND REVIEW
-      // ===============================================
 
       const review =
         await Review.findById(
           reviewId
         );
 
-      // ===============================================
       // REVIEW NOT FOUND
-      // ===============================================
 
       if (!review) {
         return res.status(404).json({
@@ -801,9 +967,7 @@ app.get(
         });
       }
 
-      // ===============================================
       // CHECK LIKE
-      // ===============================================
 
       const existingLike =
         await ReviewLike.findOne({
@@ -811,9 +975,7 @@ app.get(
           anonymousId,
         });
 
-      // ===============================================
       // RESPONSE
-      // ===============================================
 
       res.status(200).json({
         liked:
@@ -822,6 +984,7 @@ app.get(
         likes:
           Number(review.likes || 0),
       });
+
     } catch (error) {
       console.error(
         "LIKE STATUS error:",
@@ -837,6 +1000,36 @@ app.get(
 );
 
 // =====================================================
+// REQUEST / JSON PARSER ERROR HANDLER
+// =====================================================
+
+app.use((error, req, res, next) => {
+  // BODY TOO LARGE
+
+  if (error.type === "entity.too.large") {
+    return res.status(413).json({
+      message:
+        "Request body is too large.",
+    });
+  }
+
+  // INVALID JSON
+
+  if (
+    error instanceof SyntaxError &&
+    error.status === 400 &&
+    "body" in error
+  ) {
+    return res.status(400).json({
+      message:
+        "Invalid JSON request body.",
+    });
+  }
+
+  return next(error);
+});
+
+// =====================================================
 // MONGODB CONNECTION
 // =====================================================
 
@@ -848,9 +1041,7 @@ mongoose
       "✅ MongoDB Atlas connected successfully"
     );
 
-    // ===============================================
     // START SERVER
-    // ===============================================
 
     const PORT =
       process.env.PORT || 5000;
